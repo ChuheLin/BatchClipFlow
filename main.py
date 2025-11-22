@@ -1,283 +1,437 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, Menu
 import subprocess
 import os
 import json
 import threading
 import sys
 import platform
+import time
 
-# --- 配置区域 ---
-# 如果你安装了 ttkbootstrap，这里会启用美化皮肤
-# 如果没有安装，会自动降级为原生丑一点的界面，但功能完全一样
+# --- 配置与美化 ---
 try:
     import ttkbootstrap as ttk
     from ttkbootstrap.constants import *
-    STYLE_THEME = "cosmo" # 可选: cosmo, flatly, journal, minty
+    STYLE_THEME = "cosmo"
 except ImportError:
     import tkinter.ttk as ttk
     STYLE_THEME = None
 
+# 全局配置文件名 (记录上次打开的项目路径)
+APP_CONFIG_FILE = "app_config.json"
+DEFAULT_PROJECT_NAME = "default_project.json"
+
 class VideoClipperApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("BatchClipFlow - 批量视频分段工具 (便携版)")
-        self.root.geometry("950x750")
+        self.root.geometry("1200x800")
         
-        # 1. 自动检测 FFmpeg
         self.ffmpeg_path = self.find_ffmpeg()
         
-        # 2. 数据变量
-        self.video_path = tk.StringVar()
-        self.output_dir = tk.StringVar()
-        self.clip_list = [] 
+        # --- 核心状态 ---
+        self.current_project_path = None # 当前项目文件的绝对路径
+        self.project_data = {
+            "output_dir": "",
+            "auto_subfolder": True,
+            "videos": {} 
+        }
+        self.current_video_path = None
         
-        # 3. 构建界面
+        # --- UI 变量 ---
+        self.var_output_dir = tk.StringVar()
+        self.var_auto_sub = tk.BooleanVar(value=True)
+        
+        # --- 构建界面 ---
+        self.create_menu()
         self.setup_ui()
         
-        # 4. 启动检查
+        # --- 初始化加载 ---
         self.check_environment()
+        self.startup_load() # 关键：启动时恢复上次的项目
 
     def find_ffmpeg(self):
-        """
-        查找逻辑：
-        1. 优先找当前脚本所在目录下的 ffmpeg.exe (便携模式)
-        2. 其次找系统环境变量里的 ffmpeg
-        """
-        # 获取当前文件所在目录
         if getattr(sys, 'frozen', False):
-            # 如果是被打包成exe的情况
-            base_path = os.path.dirname(sys.executable)
+            base = os.path.dirname(sys.executable)
         else:
-            # 正常运行py脚本的情况
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            
-        # 检查当前目录
-        local_ffmpeg = os.path.join(base_path, "ffmpeg.exe")
-        if platform.system() != "Windows":
-             local_ffmpeg = os.path.join(base_path, "ffmpeg") # Mac/Linux不带exe后缀
-
-        if os.path.exists(local_ffmpeg):
-            return local_ffmpeg
+            base = os.path.dirname(os.path.abspath(__file__))
         
-        # 检查系统PATH
+        local = os.path.join(base, "ffmpeg.exe")
+        if platform.system() != "Windows": local = os.path.join(base, "ffmpeg")
+        
+        if os.path.exists(local): return local
         from shutil import which
-        system_ffmpeg = which("ffmpeg")
-        if system_ffmpeg:
-            return system_ffmpeg
-            
-        return None
+        return which("ffmpeg")
 
     def check_environment(self):
         if self.ffmpeg_path:
-            # 找到了，显示路径信息
-            source = "本地文件" if os.path.dirname(self.ffmpeg_path) in [os.getcwd(), os.path.dirname(os.path.abspath(__file__))] else "系统环境"
-            self.status_label.config(text=f"就绪 | FFmpeg来源: {source} ({self.ffmpeg_path})", foreground="green")
+            src = "本地" if "ffmpeg.exe" in self.ffmpeg_path else "系统"
+            self.update_status(f"FFmpeg就绪 ({src})", "green")
         else:
-            # 没找到，弹窗警告
-            self.status_label.config(text="错误: 未找到 ffmpeg.exe", foreground="red")
-            self.root.after(1000, lambda: messagebox.showwarning(
-                "缺少组件", 
-                "无法剪辑！未找到 ffmpeg.exe。\n\n解决方法：\n请下载 ffmpeg.exe 并将其放入本软件的同一文件夹内。"
-            ))
+            self.update_status("未找到FFmpeg，无法剪辑", "red")
+            self.root.after(500, lambda: messagebox.showerror("错误", "缺少 ffmpeg.exe"))
+
+    # ===========================
+    #      项目管理核心逻辑
+    # ===========================
+    
+    def startup_load(self):
+        """启动时读取全局配置，打开上次的项目"""
+        last_project = None
+        
+        # 1. 读取 app_config.json 看看上次开了啥
+        if os.path.exists(APP_CONFIG_FILE):
+            try:
+                with open(APP_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    last_project = config.get("last_opened_project")
+            except:
+                pass
+        
+        # 2. 如果没有记录，或者文件被删了，就加载/创建默认项目
+        if not last_project or not os.path.exists(last_project):
+            last_project = os.path.abspath(DEFAULT_PROJECT_NAME)
+            
+        self.load_project_file(last_project)
+
+    def create_new_project(self):
+        """新建项目：清空当前数据，询问新文件名"""
+        # 先保存当前的(虽然有自动保存，但防止万一)
+        self.trigger_autosave()
+        
+        file_path = filedialog.asksaveasfilename(
+            title="新建项目",
+            defaultextension=".json",
+            filetypes=[("BatchClip Project", "*.json")],
+            initialfile="New_Project.json"
+        )
+        
+        if file_path:
+            # 重置内存数据
+            self.project_data = {
+                "output_dir": "",
+                "auto_subfolder": True,
+                "videos": {}
+            }
+            self.current_video_path = None
+            
+            # 加载新路径并立即保存一次
+            self.current_project_path = file_path
+            self.trigger_autosave()
+            self.refresh_ui_from_data()
+            self.update_app_title()
+            self.save_app_config() # 记住这个新项目
+
+    def open_project_dialog(self):
+        """打开项目对话框"""
+        file_path = filedialog.askopenfilename(
+            title="打开项目",
+            filetypes=[("BatchClip Project", "*.json")]
+        )
+        if file_path:
+            self.load_project_file(file_path)
+
+    def load_project_file(self, file_path):
+        """实际加载逻辑"""
+        self.current_project_path = file_path
+        
+        # 如果文件不存在(比如第一次运行默认项目)，就初始化一个空的
+        if not os.path.exists(file_path):
+            self.project_data = {"output_dir": "", "auto_subfolder": True, "videos": {}}
+            self.trigger_autosave() # 创建文件
+        else:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    self.project_data = json.load(f)
+            except Exception as e:
+                messagebox.showerror("错误", f"项目文件损坏: {e}")
+                return
+
+        self.refresh_ui_from_data()
+        self.update_app_title()
+        self.save_app_config() # 记住当前打开的项目
+        self.update_status(f"已加载项目: {os.path.basename(file_path)}")
+
+    def save_app_config(self):
+        """保存全局设置：记录当前正在编辑哪个项目"""
+        config = {"last_opened_project": self.current_project_path}
+        try:
+            with open(APP_CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4)
+        except:
+            pass
+
+    def trigger_autosave(self, *args):
+        """实时保存到当前项目文件"""
+        if not self.current_project_path: return
+        
+        # 同步 UI 变量到内存
+        self.project_data["output_dir"] = self.var_output_dir.get()
+        self.project_data["auto_subfolder"] = self.var_auto_sub.get()
+        
+        try:
+            with open(self.current_project_path, 'w', encoding='utf-8') as f:
+                json.dump(self.project_data, f, indent=4, ensure_ascii=False)
+            # 状态栏显示保存时间（可选，太频繁闪烁可以去掉）
+            # self.update_status(f"已保存 {time.strftime('%H:%M:%S')}")
+        except Exception as e:
+            self.update_status(f"自动保存失败: {e}", "red")
+
+    def update_app_title(self):
+        name = os.path.basename(self.current_project_path) if self.current_project_path else "未命名"
+        self.root.title(f"BatchClipFlow Pro - {name}")
+
+    # ===========================
+    #      UI 构建与交互
+    # ===========================
+
+    def create_menu(self):
+        menubar = Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        file_menu = Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="文件 (File)", menu=file_menu)
+        file_menu.add_command(label="📄 新建项目 (New Project)", command=self.create_new_project)
+        file_menu.add_command(label="📂 打开项目 (Open Project)", command=self.open_project_dialog)
+        file_menu.add_separator()
+        file_menu.add_command(label="❌ 退出", command=self.root.quit)
 
     def setup_ui(self):
-        # === 顶部：文件选择 ===
-        top_frame = ttk.Labelframe(self.root, text="输入输出设置", padding=15)
-        top_frame.pack(fill=tk.X, padx=15, pady=10)
+        # 左右分栏
+        self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # 源视频
-        ttk.Label(top_frame, text="源视频:").grid(row=0, column=0, sticky="e", padx=5)
-        ttk.Entry(top_frame, textvariable=self.video_path, width=70).grid(row=0, column=1, padx=5)
-        ttk.Button(top_frame, text="📂 选择视频", command=self.select_video).grid(row=0, column=2)
+        # --- 左侧：视频列表 ---
+        self.frame_left = ttk.Labelframe(self.paned, text="1. 视频源列表", padding=5)
+        self.paned.add(self.frame_left, weight=1)
 
-        # 输出路径
-        ttk.Label(top_frame, text="保存到:").grid(row=1, column=0, sticky="e", padx=5, pady=10)
-        ttk.Entry(top_frame, textvariable=self.output_dir, width=70).grid(row=1, column=1, padx=5, pady=10)
-        ttk.Button(top_frame, text="📂 选择文件夹", command=self.select_output).grid(row=1, column=2)
-
-        # === 中部：列表 ===
-        list_frame = ttk.Frame(self.root, padding=10)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5)
-
-        cols = ("ID", "Start", "End", "Name", "Status")
-        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
+        lf_btn = ttk.Frame(self.frame_left)
+        lf_btn.pack(fill=tk.X, pady=5)
+        ttk.Button(lf_btn, text="➕ 导入视频", command=self.import_videos, bootstyle="primary").pack(fill=tk.X)
         
-        self.tree.heading("ID", text="序号")
-        self.tree.heading("Start", text="开始时间")
-        self.tree.heading("End", text="结束时间")
-        self.tree.heading("Name", text="输出文件名")
-        self.tree.heading("Status", text="状态")
-
-        self.tree.column("ID", width=50, anchor="center")
-        self.tree.column("Start", width=120, anchor="center")
-        self.tree.column("End", width=120, anchor="center")
-        self.tree.column("Name", width=350, anchor="w")
-        self.tree.column("Status", width=100, anchor="center")
-
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=sb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # === 底部：操作区 ===
-        control_frame = ttk.Labelframe(self.root, text="剪辑操作", padding=15)
-        control_frame.pack(fill=tk.X, padx=15, pady=10)
-
-        # 输入行
-        input_frame = ttk.Frame(control_frame)
-        input_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(input_frame, text="开始(HH:MM:SS):").pack(side=tk.LEFT)
-        self.entry_start = ttk.Entry(input_frame, width=12)
-        self.entry_start.pack(side=tk.LEFT, padx=5)
-        self.entry_start.insert(0, "00:00:00")
-
-        ttk.Label(input_frame, text="结束:").pack(side=tk.LEFT, padx=(15, 0))
-        self.entry_end = ttk.Entry(input_frame, width=12)
-        self.entry_end.pack(side=tk.LEFT, padx=5)
-        self.entry_end.insert(0, "00:00:10")
-
-        ttk.Label(input_frame, text="文件名:").pack(side=tk.LEFT, padx=(15, 0))
-        self.entry_name = ttk.Entry(input_frame, width=20)
-        self.entry_name.pack(side=tk.LEFT, padx=5)
+        self.list_videos = tk.Listbox(self.frame_left, selectmode=tk.SINGLE, font=("微软雅黑", 10), bd=0, highlightthickness=1)
+        self.list_videos.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.list_videos.bind('<<ListboxSelect>>', self.on_video_select)
         
-        # 按钮行
-        btn_frame = ttk.Frame(control_frame)
-        btn_frame.pack(fill=tk.X, pady=15)
+        ttk.Button(self.frame_left, text="🗑 移除选中视频", command=self.remove_video).pack(fill=tk.X, pady=5)
 
-        ttk.Button(btn_frame, text="⬇ 添加片段", command=self.add_clip).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="❌ 删除选中", command=self.delete_clip).pack(side=tk.LEFT, padx=5)
-        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
-        ttk.Button(btn_frame, text="💾 保存清单", command=self.save_project).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="📂 读取清单", command=self.load_project).pack(side=tk.LEFT, padx=5)
+        # --- 右侧：工作区 ---
+        self.frame_right = ttk.Labelframe(self.paned, text="2. 剪辑工作台", padding=10)
+        self.paned.add(self.frame_right, weight=4)
 
-        self.run_btn = ttk.Button(btn_frame, text="🚀 开始批量剪辑", command=self.start_processing_thread, bootstyle="success" if STYLE_THEME else None)
-        self.run_btn.pack(side=tk.RIGHT, padx=10)
+        # 全局设置
+        frame_settings = ttk.Frame(self.frame_right)
+        frame_settings.pack(fill=tk.X, pady=5)
+        ttk.Label(frame_settings, text="输出目录:").pack(side=tk.LEFT)
+        ttk.Entry(frame_settings, textvariable=self.var_output_dir).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(frame_settings, text="选择", command=self.select_output).pack(side=tk.LEFT)
+        ttk.Checkbutton(frame_settings, text="自动按视频名建文件夹", variable=self.var_auto_sub, command=self.trigger_autosave).pack(side=tk.LEFT, padx=10)
 
-        # 进度和状态
-        self.progress = ttk.Progressbar(self.root, mode='determinate')
-        self.progress.pack(fill=tk.X, padx=15, pady=(0, 5))
+        # 表格
+        cols = ("ID", "Start", "End", "Category", "Name", "Status")
+        self.tree = ttk.Treeview(self.frame_right, columns=cols, show="headings", selectmode="browse", height=10)
+        self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        self.status_label = ttk.Label(self.root, text="正在初始化...", font=("Arial", 9))
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=15, pady=5)
+        # 配置列
+        col_widths = [40, 100, 100, 100, 250, 80]
+        for c, w in zip(cols, col_widths):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, anchor="center" if c!="Name" else "w")
 
-    # --- 逻辑功能 ---
-    def select_video(self):
-        path = filedialog.askopenfilename(filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi *.flv *.ts")])
-        if path:
-            self.video_path.set(path)
-            if not self.output_dir.get():
-                self.output_dir.set(os.path.dirname(path))
+        # 编辑区
+        frame_edit = ttk.LabelFrame(self.frame_right, text="添加片段", padding=10)
+        frame_edit.pack(fill=tk.X)
 
-    def select_output(self):
-        path = filedialog.askdirectory()
-        if path: self.output_dir.set(path)
+        f_in = ttk.Frame(frame_edit)
+        f_in.pack(fill=tk.X)
+        
+        ttk.Label(f_in, text="开始:").pack(side=tk.LEFT)
+        self.ent_start = ttk.Entry(f_in, width=10); self.ent_start.pack(side=tk.LEFT, padx=5); self.ent_start.insert(0, "00:00:00")
+        
+        ttk.Label(f_in, text="结束:").pack(side=tk.LEFT)
+        self.ent_end = ttk.Entry(f_in, width=10); self.ent_end.pack(side=tk.LEFT, padx=5); self.ent_end.insert(0, "00:00:10")
+        
+        ttk.Label(f_in, text="分类:").pack(side=tk.LEFT, padx=(10,0))
+        self.ent_cat = ttk.Entry(f_in, width=10); self.ent_cat.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(f_in, text="文件名:").pack(side=tk.LEFT, padx=(10,0))
+        self.ent_name = ttk.Entry(f_in, width=20); self.ent_name.pack(side=tk.LEFT, padx=5)
+
+        # 按钮区
+        f_act = ttk.Frame(frame_edit)
+        f_act.pack(fill=tk.X, pady=10)
+        self.btn_add = ttk.Button(f_act, text="⬇ 添加片段 (Enter)", command=self.add_clip, state="disabled")
+        self.btn_add.pack(side=tk.LEFT)
+        self.root.bind('<Return>', lambda e: self.add_clip())
+        
+        ttk.Button(f_act, text="❌ 删除片段", command=self.del_clip).pack(side=tk.LEFT, padx=10)
+        
+        self.btn_run = ttk.Button(self.frame_right, text="🚀 开始批量剪辑 (所有视频)", command=self.start_processing, bootstyle="success")
+        self.btn_run.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+        
+        # 状态栏
+        self.lbl_status = ttk.Label(self.root, text="准备", relief=tk.SUNKEN, anchor="w")
+        self.lbl_status.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def update_status(self, text, color=None):
+        self.lbl_status.config(text=text, foreground=color if color else "black")
+
+    # ===========================
+    #      业务逻辑实现
+    # ===========================
+
+    def refresh_ui_from_data(self):
+        """当加载新项目时，刷新整个界面"""
+        self.var_output_dir.set(self.project_data.get("output_dir", ""))
+        self.var_auto_sub.set(self.project_data.get("auto_subfolder", True))
+        
+        # 刷新左侧视频列表
+        self.list_videos.delete(0, tk.END)
+        self.current_video_path = None # 重置选中状态
+        self.refresh_clip_tree() # 清空右侧
+        self.btn_add.config(state="disabled")
+        
+        for path in self.project_data["videos"].keys():
+            self.list_videos.insert(tk.END, f"🎬 {os.path.basename(path)}")
+
+    def import_videos(self):
+        files = filedialog.askopenfilenames(filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi *.flv *.ts")])
+        if not files: return
+        
+        count = 0
+        for f in files:
+            f = f.replace("\\", "/")
+            if f not in self.project_data["videos"]:
+                self.project_data["videos"][f] = [] 
+                count += 1
+        
+        if count > 0:
+            if not self.var_output_dir.get():
+                self.var_output_dir.set(os.path.dirname(files[0]))
+            
+            self.refresh_ui_from_data() # 简单粗暴刷新全部
+            self.trigger_autosave()
+            messagebox.showinfo("导入", f"成功导入 {count} 个视频")
+
+    def remove_video(self):
+        sel = self.list_videos.curselection()
+        if not sel: return
+        keys = list(self.project_data["videos"].keys())
+        if sel[0] < len(keys):
+            del self.project_data["videos"][keys[sel[0]]]
+            self.trigger_autosave()
+            self.refresh_ui_from_data()
+
+    def on_video_select(self, event):
+        sel = self.list_videos.curselection()
+        if not sel: return
+        keys = list(self.project_data["videos"].keys())
+        if sel[0] < len(keys):
+            self.current_video_path = keys[sel[0]]
+            self.refresh_clip_tree()
+            self.btn_add.config(state="normal")
+            self.frame_right.config(text=f"2. 剪辑工作台 - {os.path.basename(self.current_video_path)}")
+
+    def refresh_clip_tree(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        if not self.current_video_path: return
+        
+        clips = self.project_data["videos"].get(self.current_video_path, [])
+        for i, c in enumerate(clips):
+            self.tree.insert("", tk.END, values=(
+                i+1, c['start'], c['end'], c.get('category',''), c['name'], c.get('status','等待')
+            ))
 
     def add_clip(self):
-        s, e, n = self.entry_start.get(), self.entry_end.get(), self.entry_name.get()
-        if not n: n = f"clip_{len(self.clip_list)+1}"
+        if not self.current_video_path or self.btn_add['state'] == 'disabled': return
+            
+        s, e = self.ent_start.get(), self.ent_end.get()
+        cat, n = self.ent_cat.get(), self.ent_name.get()
+        if not n: n = f"clip_{len(self.project_data['videos'][self.current_video_path])+1}"
         
-        self.clip_list.append({"start": s, "end": e, "name": n, "status": "等待"})
-        self.refresh_tree()
+        new_clip = {"start": s, "end": e, "category": cat, "name": n, "status": "等待"}
+        self.project_data["videos"][self.current_video_path].append(new_clip)
         
-        # 智能流：把结束时间自动填入下一次的开始时间
-        self.entry_start.delete(0, tk.END)
-        self.entry_start.insert(0, e)
-        self.entry_name.delete(0, tk.END)
+        self.refresh_clip_tree()
+        self.trigger_autosave()
+        
+        # 智能流
+        self.ent_start.delete(0, tk.END); self.ent_start.insert(0, e)
+        self.ent_name.delete(0, tk.END)
 
-    def delete_clip(self):
+    def del_clip(self):
+        if not self.current_video_path: return
         sel = self.tree.selection()
         if sel:
             idx = self.tree.index(sel[0])
-            del self.clip_list[idx]
-            self.refresh_tree()
+            del self.project_data["videos"][self.current_video_path][idx]
+            self.refresh_clip_tree()
+            self.trigger_autosave()
 
-    def refresh_tree(self):
-        for i in self.tree.get_children(): self.tree.delete(i)
-        for i, c in enumerate(self.clip_list):
-            self.tree.insert("", tk.END, values=(i+1, c['start'], c['end'], c['name'], c['status']))
+    def select_output(self):
+        p = filedialog.askdirectory()
+        if p: 
+            self.var_output_dir.set(p)
+            self.trigger_autosave()
 
-    def save_project(self):
-        f = filedialog.asksaveasfilename(filetypes=[("JSON", "*.json")], defaultextension=".json")
-        if f:
-            with open(f, 'w', encoding='utf-8') as file:
-                json.dump({"video": self.video_path.get(), "out": self.output_dir.get(), "clips": self.clip_list}, file, indent=4)
-            messagebox.showinfo("提示", "保存成功")
+    # --- 处理逻辑 ---
+    def start_processing(self):
+        if not self.ffmpeg_path: return
+        threading.Thread(target=self.process_all_thread).start()
 
-    def load_project(self):
-        f = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if f:
-            with open(f, 'r', encoding='utf-8') as file:
-                data = json.load(file)
-                self.video_path.set(data.get("video", ""))
-                self.output_dir.set(data.get("out", ""))
-                self.clip_list = data.get("clips", [])
-                self.refresh_tree()
-
-    def start_processing_thread(self):
-        if not self.ffmpeg_path:
-            messagebox.showerror("错误", "找不到 ffmpeg.exe，无法开始！")
+    def process_all_thread(self):
+        self.btn_run.config(state="disabled")
+        base_out = self.var_output_dir.get()
+        if not base_out:
+            messagebox.showerror("错误", "请设置输出目录")
+            self.btn_run.config(state="normal")
             return
-        if not self.clip_list:
-            messagebox.showwarning("提示", "列表是空的")
-            return
-            
-        self.run_btn.config(state="disabled")
-        threading.Thread(target=self.process).start()
 
-    def process(self):
-        src = self.video_path.get()
-        dst_dir = self.output_dir.get()
-        if not os.path.exists(dst_dir): os.makedirs(dst_dir)
+        all_videos = self.project_data["videos"]
+        total_clips = sum(len(v) for v in all_videos.values())
+        processed = 0
         
-        total = len(self.clip_list)
-        _, ext = os.path.splitext(src)
-        
-        for i, item in enumerate(self.clip_list):
-            if item['status'] == "完成": continue
+        for vid_path, clips in all_videos.items():
+            if not os.path.exists(vid_path): continue
             
-            out_name = f"{item['name']}{ext}"
-            out_path = os.path.join(dst_dir, out_name)
+            vid_name = os.path.splitext(os.path.basename(vid_path))[0]
+            _, ext = os.path.splitext(vid_path)
             
-            # 更新UI
-            self.root.after(0, lambda idx=i: self.update_row(idx, "剪辑中..."))
-            
-            # 命令
-            cmd = [
-                self.ffmpeg_path, '-y',
-                '-ss', item['start'],
-                '-to', item['end'],
-                '-i', src,
-                '-c', 'copy',  # 关键：流复制
-                '-avoid_negative_ts', '1',
-                out_path
-            ]
-            
-            # 执行
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo, check=True)
-                res = "完成"
-            except Exception as e:
-                res = "失败"
-                print(e)
+            for clip in clips:
+                if clip['status'] == "完成": 
+                    processed += 1
+                    continue
                 
-            self.root.after(0, lambda idx=i, s=res: self.update_row(idx, s))
-            self.root.after(0, lambda v=(i+1)/total*100: self.progress.config(value=v))
-        
-        self.root.after(0, lambda: messagebox.showinfo("完成", "所有任务处理完毕"))
-        self.root.after(0, lambda: self.run_btn.config(state="normal"))
-        self.root.after(0, lambda: self.status_label.config(text="任务完成"))
+                final_dir = base_out
+                if self.var_auto_sub.get(): final_dir = os.path.join(final_dir, vid_name)
+                if clip.get('category'): final_dir = os.path.join(final_dir, clip['category'])
+                
+                if not os.path.exists(final_dir): os.makedirs(final_dir)
+                out_path = os.path.join(final_dir, f"{clip['name']}{ext}")
+                
+                if self.current_video_path == vid_path:
+                    self.root.after(0, lambda c=clip: self.update_row_status(c, "处理中..."))
 
-    def update_row(self, idx, status):
-        self.clip_list[idx]['status'] = status
-        # 刷新单行显示
-        item_id = self.tree.get_children()[idx]
-        vals = list(self.tree.item(item_id, 'values'))
-        vals[-1] = status
-        self.tree.item(item_id, values=vals)
+                cmd = [self.ffmpeg_path, '-y', '-ss', clip['start'], '-to', clip['end'], '-i', vid_path, '-c', 'copy', '-avoid_negative_ts', '1', out_path]
+                
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo, check=True)
+                    clip['status'] = "完成"
+                except:
+                    clip['status'] = "失败"
+                
+                processed += 1
+                self.trigger_autosave() 
+                if self.current_video_path == vid_path: self.root.after(0, self.refresh_clip_tree)
+                self.update_status(f"处理进度: {processed}/{total_clips}")
+
+        self.root.after(0, lambda: messagebox.showinfo("完成", "处理完毕"))
+        self.root.after(0, lambda: self.btn_run.config(state="normal"))
+
+    def update_row_status(self, clip_obj, status):
+        clip_obj['status'] = status
+        self.refresh_clip_tree()
 
 if __name__ == "__main__":
     if STYLE_THEME:
