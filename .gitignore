@@ -14,3 +14,10 @@ output/
 
 *.exe
 ffmpeg.exe
+
+app_config.json
+autosave_data.json
+*.json
+
+!default_project.json
+!template.json
