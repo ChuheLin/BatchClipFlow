@@ -1,15 +1,21 @@
-__pycache__/
+pycache/
 *.py[cod]
 *$py.class
 venv/
 env/
 .env
+
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
+
 *.mp4
 *.mov
 *.avi
 *.mkv
+*.ts
+*.flv
 output/
 
 *.exe
@@ -17,7 +23,11 @@ ffmpeg.exe
 
 app_config.json
 autosave_data.json
-*.json
 
+build/
+dist/
+*.spec
+
+*.json
 !default_project.json
 !template.json
