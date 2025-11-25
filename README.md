@@ -26,7 +26,7 @@ BatchClipFlow/
 pip install -r requirements.txt
 ```
 
-## 2. 获取 FFmpeg（必须）
+## 2. 获取 FFmpeg（release版本的压缩包里已经包含有FFmpeg.exe）
 
 程序依赖 FFmpeg 执行视频分段，请手动下载：
 
